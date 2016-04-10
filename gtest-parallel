@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import cPickle
+import copy
 import errno
 import gzip
 import multiprocessing
@@ -264,6 +265,8 @@ parser.add_option('--format', type='string', default='filter',
                   help='output format (raw,filter)')
 parser.add_option('--print_test_times', action='store_true', default=False,
                   help='When done, list the run time of each test')
+parser.add_option('-p', '--pack_tests', action='store_true', default=False,
+                  help='Do not invoke each test separately')
 
 (options, binaries) = parser.parse_args()
 
@@ -323,6 +326,51 @@ for test_binary in binaries:
 # new and failing tests, being considered larger than any real
 # runtime).
 tests.sort(reverse=True, key=lambda x: ((1 if x[0] is None else 0), x))
+
+def pack_tests(tests_):
+  # We start of with `options.workers` potential test sets and add tests while
+  # trying to keep runtimes of the different sets roughly equal. Tests for
+  # which we have no timing will always be executed in isolation so we can
+  # measure their runtime.
+
+  DEFAULT = [0, {}]
+  test_packs = [copy.deepcopy(DEFAULT) for _ in range(options.workers)]
+  for test in tests_:
+    timing, test_binary, name, command = test
+
+    assert len(name) == 1
+    name = name[0]
+
+    # Tests without timing information are always executed in isolation.
+    if not timing:
+      test_packs.append([timing, {test_binary: [dict(name=name, command=command)]}])
+      continue
+
+    # Find the best target pack for this test.
+    # We do not add to test we want to execute in isolation.
+    timings = [pack[0] + timing for pack in test_packs[:options.workers]]
+    target_pack = timings.index(min(timings[:options.workers]))
+
+    test_packs[target_pack][0] += timings[target_pack]
+    try:
+      test_packs[target_pack][1][test_binary].append(dict(name=name, command=command))
+    except KeyError:
+      test_packs[target_pack][1][test_binary] = [dict(name=name, command=command)]
+
+  jobs = []
+  for test_pack in test_packs:
+    for test_binary, cases in test_pack[1].items():
+      jobs.append([
+        0,
+        test_binary,
+        [case['name'] for case in cases],
+        cases[0]['command']])
+
+  return jobs
+
+# Pack tests if requested.
+if options.pack_tests:
+  tests = pack_tests(tests)
 
 # Repeat tests (-r flag).
 tests *= options.repeat
